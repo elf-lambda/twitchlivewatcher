@@ -8,8 +8,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
-	"os/exec"
 	"strings"
 	"time"
 
@@ -29,7 +29,7 @@ var Gray = "\033[37m"
 var White = "\033[97m"
 
 // Globals
-var channels []string = make([]string, 0, 16)
+var channels map[string]bool = make(map[string]bool)
 var otoCtx *oto.Context
 
 type ChannelStatus struct {
@@ -37,6 +37,7 @@ type ChannelStatus struct {
 	IsLive      bool
 	HasPlayed   bool
 	LastChanged time.Time
+	PlayTTS     bool
 }
 
 // util :)
@@ -63,9 +64,9 @@ func getFileChecksum(filePath string) []byte {
 	return h.Sum(nil)
 }
 
-// Read each line from a file into a string slice
-func getChannelsFromFile(filePath string) []string {
-	tmp := make([]string, 0, 16)
+// Read config file and parse channel=true/false format
+func getChannelsFromConfig(filePath string) map[string]bool {
+	channels := make(map[string]bool)
 	file, err := os.Open(filePath)
 	if err != nil {
 		log.Fatal(err)
@@ -74,12 +75,27 @@ func getChannelsFromFile(filePath string) []string {
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
-		tmp = append(tmp, scanner.Text())
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue // Skip empty lines and comments
+		}
+
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			fmt.Printf("Skipping invalid line: %s\n", line)
+			continue
+		}
+
+		channel := strings.TrimSpace(parts[0])
+		ttsEnabled := strings.TrimSpace(strings.ToLower(parts[1])) == "true"
+
+		channels[channel] = ttsEnabled
 	}
+
 	if err := scanner.Err(); err != nil {
 		log.Fatal(err)
 	}
-	return tmp
+	return channels
 }
 
 func initOto() (*oto.Context, error) {
@@ -87,7 +103,7 @@ func initOto() (*oto.Context, error) {
 	// play all our sounds. Its configuration can't be changed later.
 	op := &oto.NewContextOptions{
 		SampleRate:   44100,
-		ChannelCount: 1, // Stereo output
+		ChannelCount: 1, // Mono output
 		Format:       oto.FormatSignedInt16LE,
 	}
 
@@ -109,75 +125,56 @@ func checkMp3(channel string) bool {
 }
 
 func playMp3(file []byte, volume float64) {
+	// Check if file data is valid
+	if len(file) == 0 {
+		fmt.Println("Warning: Empty MP3 data, skipping playback")
+		return
+	}
+
 	fileBytesReader := bytes.NewReader(file)
-	// Decode file. This process is done as the file plays so it won't
-	// load the whole thing into memory.
 	decodedMp3, err := mp3.NewDecoder(fileBytesReader)
 	if err != nil {
-		panic("mp3.NewDecoder failed: " + err.Error())
+		fmt.Printf("Warning: mp3.NewDecoder failed: %s, skipping playback\n", err.Error())
+		return
 	}
 	player := otoCtx.NewPlayer(decodedMp3)
 
 	player.SetVolume(volume)
 
-	// Play starts playing the sound and returns without waiting for it (Play() is async).
 	player.Play()
 
-	// We can wait for the sound to finish playing using something like this
 	for player.IsPlaying() {
 		time.Sleep(time.Millisecond)
 	}
 
-	// If you don't want the player/sound anymore simply close
 	err = player.Close()
 	if err != nil {
-		panic("player.Close failed: " + err.Error())
+		fmt.Printf("Warning: player.Close failed: %s\n", err.Error())
 	}
-
 }
 
+// Check the stream status using the CDN
 func checkStreamStatus(channel string) (string, bool) {
-	// url := "https://www.twitch.tv/" + channel
-	url := "https://decapi.me/twitch/uptime/" + channel
+	timestamp := time.Now().Unix()
+	url := fmt.Sprintf("https://static-cdn.jtvnw.net/previews-ttv/live_user_%s-320x180.jpg?timestamp=%d", channel, timestamp)
 
 	resp, err := http.Get(url)
 	if err != nil {
 		fmt.Printf("Error fetching the URL: %v\n", err)
-		return "error", false
+		return channel, false
 	}
 	defer resp.Body.Close()
 
-	// Check for a successful HTTP status
-	if resp.StatusCode != http.StatusOK {
-		fmt.Printf("Failed to fetch the URL. HTTP Status: %s\n", resp.Status)
-		return "error", false
-	}
-
-	// Read the response body
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		fmt.Printf("Error reading response body: %v\n", err)
-		return "error", false
-	}
-
-	// Check if the stream is live? might break in the future
-	// if strings.Contains(string(body), `isLiveBroadcast`) {
-	// 	return channel, true
-	// } else {
-	// 	return channel, false
-	// }
-
-	// for decapi
-	// Check if the stream is live? might break in the future
-	if strings.Contains(string(body), `offline`) {
-		// fmt.Println(channel, "is live!")
+	finalURL := resp.Request.URL.String()
+	if strings.Contains(finalURL, "404_preview") {
 		return channel, false
 	} else {
-		// fmt.Println(channel, "is offline!")
 		return channel, true
 	}
 }
 
+// Check if mp3 file exists, otherwise generate one
+// TODO: add local TTS
 func getMp3ForChannel(channel string) []byte {
 	var body []byte
 	haveFile := checkMp3(channel)
@@ -189,8 +186,9 @@ func getMp3ForChannel(channel string) []byte {
 		}
 		return body
 	} else {
+		textParam := url.QueryEscape(channel + " is now live.")
+		streamElementsUrl := fmt.Sprintf("https://api.streamelements.com/kappa/v2/speech?voice=Brian&text=%s", textParam)
 
-		streamElementsUrl := fmt.Sprintf("https://api.streamelements.com/kappa/v2/speech?voice=Brian&text=%s is now live.", channel)
 		resp, err := http.Get(streamElementsUrl)
 		if err != nil {
 			fmt.Printf("Error fetching the URL: %v\n", err)
@@ -198,13 +196,13 @@ func getMp3ForChannel(channel string) []byte {
 		}
 		defer resp.Body.Close()
 
-		// Check for a successful HTTP status
-		if resp.StatusCode != http.StatusOK {
-			fmt.Printf("Failed to fetch the URL. HTTP Status: %s\n", resp.Status)
+		time.Sleep(500 * time.Millisecond)
+
+		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotModified {
+			fmt.Printf("Failed to fetch the URL. HTTP Status: %s\n%s\n", resp.Status, streamElementsUrl)
 			return nil
 		}
 
-		// Read the response body
 		body, err = io.ReadAll(resp.Body)
 		if err != nil {
 			fmt.Printf("Error reading response body: %v\n", err)
@@ -217,26 +215,17 @@ func getMp3ForChannel(channel string) []byte {
 	}
 }
 
-// Create the tts whitelist string
-func createTtsString(filePath string) string {
-	list := getChannelsFromFile(filePath)
-	var buffer bytes.Buffer
-	for _, v := range list {
-		buffer.WriteString(v + ";")
-	}
-	return buffer.String()
-}
-
 // Initialize the slice of channel statuses
 func initStreamsSlice() []ChannelStatus {
 	var channelStatuses []ChannelStatus
-	for _, channel := range channels {
+	for channel, playTTS := range channels {
 		_, status := checkStreamStatus(channel)
 		channelStatuses = append(channelStatuses, ChannelStatus{
 			Name:        channel,
 			IsLive:      status,
 			HasPlayed:   false,
 			LastChanged: time.Now(),
+			PlayTTS:     playTTS,
 		})
 	}
 	return channelStatuses
@@ -245,58 +234,66 @@ func initStreamsSlice() []ChannelStatus {
 // Print the slice of channel statuses
 func printSlice(channels []ChannelStatus) {
 	for _, channel := range channels {
+		ttsIndicator := ""
+		if channel.PlayTTS {
+			ttsIndicator = fmt.Sprintf(" %s[TTS]%s", Yellow, Reset)
+		}
+
 		if channel.IsLive { // If live
-			fmt.Printf("%-17s -> %s[ %s ]%7s hasPlayed: %s%t%s\n",
-				channel.Name, Green, "LIVE", Reset, Cyan, channel.HasPlayed, Reset)
+			fmt.Printf("%-17s -> %s[ %s ]%s%s hasPlayed: %s%t%s\n",
+				channel.Name, Green, "LIVE", Reset, ttsIndicator, Cyan, channel.HasPlayed, Reset)
 		} else { // If offline
 			continue
-			fmt.Printf("%-17s -> %s[ %s ]%s hasPlayed: %s%t%s\n",
-				channel.Name, Red, "OFFLINE", Reset, Cyan, channel.HasPlayed, Reset)
+			fmt.Printf("%-17s -> %s[ %s ]%s%s hasPlayed: %s%t%s\n",
+				channel.Name, Red, "OFFLINE", Reset, ttsIndicator, Cyan, channel.HasPlayed, Reset)
 		}
 	}
 }
 
 func main() {
-	streamsFile := "streams.txt"
-	fmt.Printf("checksum: %x\n", getFileChecksum(streamsFile))
-	channels = getChannelsFromFile(streamsFile)
+	configFile := "channels.txt"
+	channels = getChannelsFromConfig(configFile)
 	otoCtx, _ = initOto()
 
-	for _, channel := range channels {
-		fmt.Println(channel)
+	fmt.Println("Loaded channels:")
+	for channel, playTTS := range channels {
+		ttsStatus := "[TTS OFF]"
+		if playTTS {
+			ttsStatus = "[TTS ON]"
+		}
+		fmt.Printf("  %s = %s\n", channel, ttsStatus)
 	}
 
-	// Initialize the slice
+	fmt.Println("Pre-generating TTS files for all channels...")
+	time.Sleep(2 * time.Second)
+
+	// Pre-gen TTS for ALL Channels
+	for channel := range channels {
+		fmt.Printf("Checking TTS for %s\n", channel)
+		getMp3ForChannel(channel)
+
+	}
+
+	time.Sleep(4 * time.Second)
 	channelStatuses := initStreamsSlice()
 	printSlice(channelStatuses)
 
-	ttsString := createTtsString("tts.txt")
-	fmt.Println(ttsString)
-
-	fmt.Println("Attempting to pre-generates tts files...")
-	time.Sleep(2000)
-	ttsFiles := getChannelsFromFile("tts.txt")
-	for _, v := range ttsFiles {
-		fmt.Println("Checking ", v)
-		getMp3ForChannel(v)
-	}
-	time.Sleep(4000)
-
-	// Enter the for loop
+	// Enter the main monitoring loop
 	for {
 		for i := range channelStatuses {
-			// Check the live status
 			_, isOnline := checkStreamStatus(channelStatuses[i].Name)
 			time.Sleep(time.Millisecond * 100)
 			currentTime := time.Now()
 
 			if channelStatuses[i].IsLive && !channelStatuses[i].HasPlayed {
 				// If live but hasnt played
-				if strings.Contains(ttsString, channelStatuses[i].Name) {
+				if channelStatuses[i].PlayTTS {
 					mp3 := getMp3ForChannel(channelStatuses[i].Name)
-					fmt.Printf("Playing mp3 from local file %s.mp3\n", channelStatuses[i].Name)
-					playMp3(mp3, 0.10)
-					channelStatuses[i].HasPlayed = true
+					if len(mp3) > 0 {
+						fmt.Printf("Playing mp3 from local file %s.mp3\n", channelStatuses[i].Name)
+						playMp3(mp3, 0.10)
+						channelStatuses[i].HasPlayed = true
+					}
 				}
 			} else if channelStatuses[i].IsLive == isOnline {
 				// If status hasnt changed, move on
@@ -305,12 +302,13 @@ func main() {
 				// If previously offline but now online
 				if currentTime.Sub(channelStatuses[i].LastChanged) > 5*time.Minute {
 					// If enough time passed (+5 minutes)
-					if strings.Contains(ttsString, channelStatuses[i].Name) {
+					if channelStatuses[i].PlayTTS {
 						mp3 := getMp3ForChannel(channelStatuses[i].Name)
-						fmt.Printf("Playing mp3 from local file %s.mp3\n", channelStatuses[i].Name)
-						playMp3(mp3, 0.10)
-						channelStatuses[i].HasPlayed = true
-
+						if len(mp3) > 0 {
+							fmt.Printf("Playing mp3 from local file %s.mp3\n", channelStatuses[i].Name)
+							playMp3(mp3, 0.10)
+							channelStatuses[i].HasPlayed = true
+						}
 					}
 					channelStatuses[i].LastChanged = currentTime
 				}
@@ -323,14 +321,11 @@ func main() {
 			}
 		}
 
-		// Clear the screen - windows only
-		c := exec.Command("clear")
-		c.Stdout = os.Stdout
-		c.Run()
+		// clear screen 0_o
+		fmt.Print("\033[2J\033[H")
 
-		// Print the updated statuses
 		printSlice(channelStatuses)
-		fmt.Println("Waiting 5 miutes...")
+		fmt.Println("Waiting 5 minutes...")
 		time.Sleep(5 * time.Minute)
 	}
 }
